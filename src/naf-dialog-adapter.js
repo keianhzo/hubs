@@ -32,6 +32,7 @@ const PC_PROPRIETARY_CONSTRAINTS = {
 
 const ICE_RECONNECT_INTERVAL = 2000;
 const INITIAL_ROOM_RECONNECTION_INTERVAL = 2000;
+const DISCONNECT_RETRY_DELAY = 2000;
 
 const isFirefox = navigator.userAgent.toLowerCase().indexOf("firefox") > -1;
 
@@ -68,6 +69,7 @@ export default class DialogAdapter {
     this._recvTaskId = null;
     this._closed = true;
     this.scene = document.querySelector("a-scene");
+    this._listeners = new Map();
   }
 
   get serverUrl() {
@@ -146,6 +148,24 @@ export default class DialogAdapter {
     this._onOccupantMessage = messageListener;
   }
 
+  // Add an event listener for a peer and an event type
+  addEventListener(peerId, eventType, listener) {
+    if (!this._listeners.has(peerId)) {
+      this._listeners.set(peerId, {
+        [eventType]: listener
+      });
+    } else {
+      this._listeners.get(peerId)[eventType] = listener;
+    }
+  }
+
+  // Removes an event listener for a peer and an event type
+  removeEventListener(peerId, eventType) {
+    if (this._listeners.has(peerId)) {
+      delete this._listeners.get(peerId)[eventType];
+    }
+  }
+
   /**
    * Gets transport/consumer/producer stats on the server side.
    */
@@ -202,12 +222,43 @@ export default class DialogAdapter {
    * https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/setConfiguration
    * So we recreate the transports/consumer/producers through reconnect to force setting
    * new ICE servers for both send and receive transports.
+   * If we are not using TURN at all we can just restart ICE in any navigator
+   * and avoid the server refresh part.
    */
+
+  async iceRestart(transport) {
+    // Force an ICE restart to gather new candidates and trigger a reconnection
+    this.emitRTCEvent(
+      "log",
+      "RTC",
+      () => `Restarting ${transport.id === this._sendTransport.id ? "send" : "receive"} transport ICE`
+    );
+    const iceParameters = await this._protoo.request("restartIce", { transportId: transport.id });
+    await transport.restartIce({ iceParameters });
+  }
+
+  async tryIceRestart(transport) {
+    // FF automatically attempts to connect after a disconnect but that doesn't happen in Chome/Safari so we retry after 2 secs
+    if (!isFirefox && transport.connectionState === "disconnected") {
+      setTimeout(async () => {
+        if (transport.connectionState === "disconnected") {
+          await this.iceRestart(transport);
+        }
+      }, DISCONNECT_RETRY_DELAY);
+    } else {
+      await this.iceRestart(transport);
+    }
+  }
 
   /**
    * Restart ICE in the underlying send peerconnection.
    */
   async restartSendICE(force = true) {
+    // Do not restart ICE if Signaling is disconnected. We are not in the meeting room if that's the case.
+    if (this._closed) {
+      return;
+    }
+
     if (!this._sendTransport?._closed) {
       // Renegotiate ICE in case ICE state is "failed".
       // Chrome doesn't seem to automatically reconnect after a "disconnected" so we renegotiate in that case.
@@ -218,19 +269,31 @@ export default class DialogAdapter {
         (!isFirefox && this._sendTransport.connectionState === "disconnected") ||
         (this._sendTransport.connectionState === "new" && this._lastSendConnectionState === "failed")
       ) {
-        this.emitRTCEvent("log", "RTC", () => `Restarting send transport ICE`);
-        if (this._protoo.connected) {
+        if (this._forceTurn || this._forceTcp) {
+          // In casen case we are using the TURN server we need to update the ICE servers as the credentials have probably expired
+          const { host, port, turn } = await window.APP.hubChannel.getHost();
+          const iceServers = this.getIceServers(host, port, turn);
           if (isFirefox) {
-            this.reconnect();
-          } else if (!this._sendTransport.closed) {
-            const { host, port, turn } = await window.APP.hubChannel.getHost();
-            const iceServers = this.getIceServers(host, port, turn);
+            // FF doesn't support hot updating the ICE servers so we need to recreate
+            this.emitRTCEvent("log", "RTC", () => `Restarting send tnsport ICE`);
+            this.closeSendTransport();
+            await this.createSendTransport(iceServers);
+          } else {
+            // For other browsers we can just update them preserving the current transport
             await this._sendTransport.updateIceServers({ iceServers });
-            const iceParameters = await this._protoo.request("restartIce", { transportId: this._sendTransport.id });
-            await this._sendTransport.restartIce({ iceParameters });
+            await this.tryIceRestart(this._sendTransport);
           }
+        } else {
+          // If we are using STUN, we can just restart ICE
+          await this.tryIceRestart(this._sendTransport);
         }
       }
+    } else {
+      // If the transport is closed but the signaling is connected, we try to recreate
+      this.emitRTCEvent("log", "RTC", () => `Restarting send tnsport ICE`);
+      const { host, port, turn } = await window.APP.hubChannel.getHost();
+      const iceServers = this.getIceServers(host, port, turn);
+      await this.createSendTransport(iceServers);
     }
   }
 
@@ -240,7 +303,7 @@ export default class DialogAdapter {
    * @param {boolean} connectionState The transport connnection state (ICE connection state)
    */
   checkSendIceStatus(connectionState) {
-    // If the ICE connection state failed we force an ICE negotiation
+    // If the ICE connection state is failed  or disconnected. we force an ICE restart
     if (connectionState === "failed" || connectionState === "disconnected") {
       this.restartSendICE(false);
     } else if (connectionState === "connected") {
@@ -253,17 +316,12 @@ export default class DialogAdapter {
 
   /**
    * Starts a watchdog to monitorize the state of the Send Transport ICE connection state.
-   * @param {boolean} force Forces the execution of the reconnect.
    */
-  startSendIceConnectionStateWd(force = false) {
-    if (force) {
-      this.reconnect();
-    } else {
-      if (!this._sendTaskId) {
-        this._sendTaskId = setInterval(() => {
-          this.restartSendICE(false);
-        }, ICE_RECONNECT_INTERVAL);
-      }
+  startSendIceConnectionStateWd() {
+    if (!this._sendTaskId) {
+      this._sendTaskId = setInterval(() => {
+        this.restartSendICE(false);
+      }, ICE_RECONNECT_INTERVAL);
     }
   }
 
@@ -280,39 +338,58 @@ export default class DialogAdapter {
    * @param {boolean} force Forces the execution of the reconnect.
    */
   async restartRecvICE(force = true) {
-    // Renegotiate ICE in case ICE state is "failed".
-    // Chrome doesn't seem to automatically reconnect after a "disconnected" so we renegotiate in that case.
-    // We also try to renegotiate in case we got stuck in a new state after an ICE failure.
+    // Do not restart ICE if Signaling is disconnected. We are not in the meeting room if that's the case.
+    if (this._closed) {
+      return;
+    }
+
     if (!this._recvTransport?._closed) {
+      // Renegotiate ICE in case ICE state is "failed".
+      // Chrome doesn't seem to automatically reconnect after a "disconnected" so we renegotiate in that case.
+      // We also try to renegotiate in case we got stuck in a new state after an ICE failure.
       if (
         force ||
         this._recvTransport.connectionState === "failed" ||
         (!isFirefox && this._recvTransport.connectionState === "disconnected") ||
         (this._recvTransport.connectionState === "new" && this._lastRecvConnectionState === "failed")
       ) {
-        this.emitRTCEvent("log", "RTC", () => `Restarting receive transport ICE`);
-        if (this._protoo.connected) {
+        if (this._forceTurn || this._forceTcp) {
+          // In casen case we are using the TURN server we need to update the ICE servers as the credentials have probably expired
+          const { host, port, turn } = await window.APP.hubChannel.getHost();
+          const iceServers = this.getIceServers(host, port, turn);
           if (isFirefox) {
-            this.reconnect();
-          } else if (!this._recvTransport.closed) {
-            const { host, port, turn } = await window.APP.hubChannel.getHost();
-            const iceServers = this.getIceServers(host, port, turn);
+            // FF doesn't support hot updating the ICE servers so we need to recreate
+            this.emitRTCEvent("log", "RTC", () => `Restarting receive transport ICE`);
+            this.closeRecvTransport();
+            await this.createRecvTransport(iceServers);
+            this.createMissingConsumers();
+          } else {
+            // For other browsers we can just update them preserving the current transport
             await this._recvTransport.updateIceServers({ iceServers });
-            const iceParameters = await this._protoo.request("restartIce", { transportId: this._recvTransport.id });
-            await this._recvTransport.restartIce({ iceParameters });
+            await this.tryIceRestart(this._recvTransport);
           }
+        } else {
+          // If we are using STUN, we can just restart ICE
+          await this.tryIceRestart(this._recvTransport);
         }
       }
+    } else {
+      // If the transport is closed but the signaling is connected, we try to recreate
+      this.emitRTCEvent("log", "RTC", () => `Restarting receive transport ICE`);
+      const { host, port, turn } = await window.APP.hubChannel.getHost();
+      const iceServers = this.getIceServers(host, port, turn);
+      await this.createRecvTransport(iceServers);
+      await this.createMissingConsumers();
     }
   }
 
   /**
-   * Checks the Send Transport ICE status and restarts it in case is in failed or disconnected states.
-   * This is called by the Send Transport "connectionstatechange" event listener.
+   * Checks the ReeceiveReeceive Transport ICE status and restarts it in case is in failed or disconnected states.
+   * This is called by the Reeceive Transport "connectionstatechange" event listener.
    * @param {boolean} connectionState The transport connection state (ICE connection state)
    */
   checkRecvIceStatus(connectionState) {
-    // If the ICE connection state failed we force an ICE negotiation
+    // If the ICE connection state is failed  or disconnected. we force an ICE restart
     if (connectionState === "failed" || connectionState === "disconnected") {
       this.restartRecvICE(false);
     } else if (connectionState === "connected") {
@@ -325,17 +402,12 @@ export default class DialogAdapter {
 
   /**
    * Starts a watchdog to monitorize the state of the Receive Transport ICE connection state.
-   * @param {boolean} force Forces the execution of the reconnect.
    */
-  startRecvIceConnectionStateWd(force = false) {
-    if (force) {
-      this.reconnect();
-    } else {
-      if (!this._recvTaskId) {
-        this._recvTaskId = setInterval(() => {
-          this.restartRecvICE(false);
-        }, ICE_RECONNECT_INTERVAL);
-      }
+  startRecvIceConnectionStateWd() {
+    if (!this._recvTaskId) {
+      this._recvTaskId = setInterval(() => {
+        this.restartRecvICE(false);
+      }, ICE_RECONNECT_INTERVAL);
     }
   }
 
@@ -421,6 +493,11 @@ export default class DialogAdapter {
                 this._initialAudioConsumerResolvers.delete(peerId);
               }
             }
+
+            // Notify of an stream update event of type (audio/video)
+            if (this._listeners.has(peerId) && this._listeners.get(peerId)[kind]) {
+              this._listeners.get(peerId)[kind].onStreamUpdated(peerId, kind);
+            }
           } catch (err) {
             this.emitRTCEvent("error", "Adapter", () => `Error: ${err}`);
             error('"newConsumer" request failed:%o', err);
@@ -439,51 +516,14 @@ export default class DialogAdapter {
       switch (notification.method) {
         case "newPeer": {
           const peer = notification.data;
-          this._onOccupantConnected(peer.id);
-          this.occupants[peer.id] = peer;
-
-          if (this._onOccupantsChanged) {
-            this._onOccupantsChanged(this.occupants);
-          }
+          this.newPeer(peer);
 
           break;
         }
 
         case "peerClosed": {
           const { peerId } = notification.data;
-          this._onOccupantDisconnected(peerId);
-
-          const pendingMediaRequests = this._pendingMediaRequests.get(peerId);
-
-          if (pendingMediaRequests) {
-            const msg = "The user disconnected before the media stream was resolved.";
-            info(msg);
-
-            if (pendingMediaRequests.audio) {
-              pendingMediaRequests.audio.resolve(null);
-            }
-
-            if (pendingMediaRequests.video) {
-              pendingMediaRequests.video.resolve(null);
-            }
-
-            this._pendingMediaRequests.delete(peerId);
-          }
-
-          // Resolve initial audio resolver since this person left.
-          const initialAudioResolver = this._initialAudioConsumerResolvers.get(peerId);
-
-          if (initialAudioResolver) {
-            initialAudioResolver();
-
-            this._initialAudioConsumerResolvers.delete(peerId);
-          }
-
-          delete this.occupants[peerId];
-
-          if (this._onOccupantsChanged) {
-            this._onOccupantsChanged(this.occupants);
-          }
+          this.closePeer(peerId);
 
           break;
         }
@@ -519,9 +559,60 @@ export default class DialogAdapter {
     await Promise.all([this.updateTimeOffset(), this._initialAudioConsumerPromise]);
   }
 
+  newPeer(peer) {
+    this._onOccupantConnected(peer.id);
+    this.occupants[peer.id] = peer;
+
+    if (this._onOccupantsChanged) {
+      this._onOccupantsChanged(this.occupants);
+    }
+  }
+
+  closePeer(peerId) {
+    this._onOccupantDisconnected(peerId);
+
+    const pendingMediaRequests = this._pendingMediaRequests.get(peerId);
+
+    if (pendingMediaRequests) {
+      const msg = "The user disconnected before the media stream was resolved.";
+      info(msg);
+
+      if (pendingMediaRequests.audio) {
+        pendingMediaRequests.audio.resolve(null);
+      }
+
+      if (pendingMediaRequests.video) {
+        pendingMediaRequests.video.resolve(null);
+      }
+
+      this._pendingMediaRequests.delete(peerId);
+    }
+
+    // Resolve initial audio resolver since this person left.
+    const initialAudioResolver = this._initialAudioConsumerResolvers.get(peerId);
+
+    if (initialAudioResolver) {
+      initialAudioResolver();
+
+      this._initialAudioConsumerResolvers.delete(peerId);
+    }
+
+    delete this.occupants[peerId];
+
+    if (this._onOccupantsChanged) {
+      this._onOccupantsChanged(this.occupants);
+    }
+
+    // Remove all the event listeners for the peer
+    if (this._listeners.has(peerId)) {
+      this._listeners.remove(peerId);
+    }
+  }
+
   shouldStartConnectionTo() {
     return true;
   }
+
   startStreamConnection() {}
 
   closeStreamConnection() {}
@@ -613,6 +704,165 @@ export default class DialogAdapter {
     // Not implemented
   }
 
+  async createSendTransport(iceServers) {
+    // Create mediasoup Transport for sending (unless we don't want to produce).
+    const sendTransportInfo = await this._protoo.request("createWebRtcTransport", {
+      producing: true,
+      consuming: false,
+      sctpCapabilities: undefined
+    });
+
+    this._sendTransport = this._mediasoupDevice.createSendTransport({
+      id: sendTransportInfo.id,
+      iceParameters: sendTransportInfo.iceParameters,
+      iceCandidates: sendTransportInfo.iceCandidates,
+      dtlsParameters: sendTransportInfo.dtlsParameters,
+      sctpParameters: sendTransportInfo.sctpParameters,
+      iceServers,
+      iceTransportPolicy: this._iceTransportPolicy,
+      proprietaryConstraints: PC_PROPRIETARY_CONSTRAINTS
+    });
+
+    this._sendTransport.on("connect", (
+      { dtlsParameters },
+      callback,
+      errback // eslint-disable-line no-shadow
+    ) => {
+      this.emitRTCEvent("info", "RTC", () => `Send transport [connect]`);
+      this._sendTransport.observer.on("close", () => {
+        this.emitRTCEvent("info", "RTC", () => `Send transport [close]`);
+        !this._sendTransport?._closed && this._sendTransport.close();
+      });
+      this._sendTransport.observer.on("newproducer", producer => {
+        this.emitRTCEvent("info", "RTC", () => `Send transport [newproducer]: ${producer.id}`);
+      });
+      this._sendTransport.observer.on("newconsumer", consumer => {
+        this.emitRTCEvent("info", "RTC", () => `Send transport [newconsumer]: ${consumer.id}`);
+      });
+
+      this._protoo
+        .request("connectWebRtcTransport", {
+          transportId: this._sendTransport.id,
+          dtlsParameters
+        })
+        .then(callback)
+        .catch(errback);
+    });
+
+    this._sendTransport.on("connectionstatechange", connectionState => {
+      let level = "info";
+      if (connectionState === "failed" || connectionState === "disconnected") {
+        level = "error";
+      }
+      this.emitRTCEvent(level, "RTC", () => `Send transport [connectionstatechange]: ${connectionState}`);
+
+      this.checkSendIceStatus(connectionState);
+    });
+
+    this._sendTransport.on("produce", async ({ kind, rtpParameters, appData }, callback, errback) => {
+      this.emitRTCEvent("info", "RTC", () => `Send transport [produce]: ${kind}`);
+      try {
+        // eslint-disable-next-line no-shadow
+        const { id } = await this._protoo.request("produce", {
+          transportId: this._sendTransport.id,
+          kind,
+          rtpParameters,
+          appData
+        });
+
+        callback({ id });
+      } catch (error) {
+        this.emitRTCEvent("error", "Signaling", () => `[produce] error: ${error}`);
+        errback(error);
+      }
+    });
+
+    if (this._localMediaStream) {
+      this.createMissingProducers(this._localMediaStream);
+    }
+  }
+
+  closeSendTransport() {
+    if (this._micProducer) {
+      this._micProducer.close();
+      this._protoo.connected && this._protoo.request("closeProducer", { producerId: this._micProducer.id });
+      this._micProducer = null;
+    }
+
+    if (this._videoProducer) {
+      this._videoProducer.close();
+      this._protoo.connected && this._protoo.request("closeProducer", { producerId: this._videoProducer.id });
+      this._videoProducer = null;
+    }
+
+    !this._sendTransport?._closed && this._sendTransport.close();
+    this._protoo.connected && this._protoo.request("closeWebRtcTransport", { transportId: this._sendTransport?.id });
+  }
+
+  async createRecvTransport(iceServers) {
+    // Create mediasoup Transport for sending (unless we don't want to consume).
+    const recvTransportInfo = await this._protoo.request("createWebRtcTransport", {
+      producing: false,
+      consuming: true,
+      sctpCapabilities: undefined
+    });
+
+    this._recvTransport = this._mediasoupDevice.createRecvTransport({
+      id: recvTransportInfo.id,
+      iceParameters: recvTransportInfo.iceParameters,
+      iceCandidates: recvTransportInfo.iceCandidates,
+      dtlsParameters: recvTransportInfo.dtlsParameters,
+      sctpParameters: recvTransportInfo.sctpParameters,
+      iceServers,
+      iceTransportPolicy: this._iceTransportPolicy
+    });
+
+    this._recvTransport.on("connect", (
+      { dtlsParameters },
+      callback,
+      errback // eslint-disable-line no-shadow
+    ) => {
+      this.emitRTCEvent("info", "RTC", () => `Receive transport [connect]`);
+      this._recvTransport.observer.on("close", () => {
+        this.emitRTCEvent("info", "RTC", () => `Receive transport [close]`);
+        !this._recvTransport?._closed && this._recvTransport.close();
+      });
+      this._recvTransport.observer.on("newproducer", producer => {
+        this.emitRTCEvent("info", "RTC", () => `Receive transport [newproducer]: ${producer.id}`);
+      });
+      this._recvTransport.observer.on("newconsumer", consumer => {
+        this.emitRTCEvent("info", "RTC", () => `Receive transport [newconsumer]: ${consumer.id}`);
+      });
+
+      this._protoo
+        .request("connectWebRtcTransport", {
+          transportId: this._recvTransport.id,
+          dtlsParameters
+        })
+        .then(callback)
+        .catch(errback);
+    });
+
+    this._recvTransport.on("connectionstatechange", connectionState => {
+      let level = "info";
+      if (connectionState === "failed" || connectionState === "disconnected") {
+        level = "error";
+      }
+      this.emitRTCEvent(level, "RTC", () => `Receive transport [connectionstatechange]: ${connectionState}`);
+
+      this.checkRecvIceStatus(connectionState);
+    });
+  }
+
+  closeRecvTransport() {
+    !this._recvTransport?._closed && this._recvTransport.close();
+    this._protoo.connected && this._protoo.request("closeWebRtcTransport", { transportId: this._recvTransport?.id });
+  }
+
+  async createMissingConsumers() {
+    await this._protoo.request("getPeers");
+  }
+
   async _joinRoom() {
     debug("_joinRoom()");
 
@@ -626,128 +876,8 @@ export default class DialogAdapter {
       const { host, port, turn } = await window.APP.hubChannel.getHost();
       const iceServers = this.getIceServers(host, port, turn);
 
-      // Create mediasoup Transport for sending (unless we don't want to produce).
-      const sendTransportInfo = await this._protoo.request("createWebRtcTransport", {
-        producing: true,
-        consuming: false,
-        sctpCapabilities: undefined
-      });
-
-      this._sendTransport = this._mediasoupDevice.createSendTransport({
-        id: sendTransportInfo.id,
-        iceParameters: sendTransportInfo.iceParameters,
-        iceCandidates: sendTransportInfo.iceCandidates,
-        dtlsParameters: sendTransportInfo.dtlsParameters,
-        sctpParameters: sendTransportInfo.sctpParameters,
-        iceServers,
-        iceTransportPolicy: this._iceTransportPolicy,
-        proprietaryConstraints: PC_PROPRIETARY_CONSTRAINTS
-      });
-
-      this._sendTransport.on("connect", (
-        { dtlsParameters },
-        callback,
-        errback // eslint-disable-line no-shadow
-      ) => {
-        this.emitRTCEvent("info", "RTC", () => `Send transport [connect]`);
-        this._sendTransport.observer.on("close", () => {
-          this.emitRTCEvent("info", "RTC", () => `Send transport [close]`);
-        });
-        this._sendTransport.observer.on("newproducer", producer => {
-          this.emitRTCEvent("info", "RTC", () => `Send transport [newproducer]: ${producer.id}`);
-        });
-        this._sendTransport.observer.on("newconsumer", consumer => {
-          this.emitRTCEvent("info", "RTC", () => `Send transport [newconsumer]: ${consumer.id}`);
-        });
-
-        this._protoo
-          .request("connectWebRtcTransport", {
-            transportId: this._sendTransport.id,
-            dtlsParameters
-          })
-          .then(callback)
-          .catch(errback);
-      });
-
-      this._sendTransport.on("connectionstatechange", connectionState => {
-        let level = "info";
-        if (connectionState === "failed" || connectionState === "disconnected") {
-          level = "error";
-        }
-        this.emitRTCEvent(level, "RTC", () => `Send transport [connectionstatechange]: ${connectionState}`);
-
-        this.checkSendIceStatus(connectionState);
-      });
-
-      this._sendTransport.on("produce", async ({ kind, rtpParameters, appData }, callback, errback) => {
-        this.emitRTCEvent("info", "RTC", () => `Send transport [produce]: ${kind}`);
-        try {
-          // eslint-disable-next-line no-shadow
-          const { id } = await this._protoo.request("produce", {
-            transportId: this._sendTransport.id,
-            kind,
-            rtpParameters,
-            appData
-          });
-
-          callback({ id });
-        } catch (error) {
-          this.emitRTCEvent("error", "Signaling", () => `[produce] error: ${error}`);
-          errback(error);
-        }
-      });
-
-      // Create mediasoup Transport for sending (unless we don't want to consume).
-      const recvTransportInfo = await this._protoo.request("createWebRtcTransport", {
-        producing: false,
-        consuming: true,
-        sctpCapabilities: undefined
-      });
-
-      this._recvTransport = this._mediasoupDevice.createRecvTransport({
-        id: recvTransportInfo.id,
-        iceParameters: recvTransportInfo.iceParameters,
-        iceCandidates: recvTransportInfo.iceCandidates,
-        dtlsParameters: recvTransportInfo.dtlsParameters,
-        sctpParameters: recvTransportInfo.sctpParameters,
-        iceServers,
-        iceTransportPolicy: this._iceTransportPolicy
-      });
-
-      this._recvTransport.on("connect", (
-        { dtlsParameters },
-        callback,
-        errback // eslint-disable-line no-shadow
-      ) => {
-        this.emitRTCEvent("info", "RTC", () => `Receive transport [connect]`);
-        this._recvTransport.observer.on("close", () => {
-          this.emitRTCEvent("info", "RTC", () => `Receive transport [close]`);
-        });
-        this._recvTransport.observer.on("newproducer", producer => {
-          this.emitRTCEvent("info", "RTC", () => `Receive transport [newproducer]: ${producer.id}`);
-        });
-        this._recvTransport.observer.on("newconsumer", consumer => {
-          this.emitRTCEvent("info", "RTC", () => `Receive transport [newconsumer]: ${consumer.id}`);
-        });
-
-        this._protoo
-          .request("connectWebRtcTransport", {
-            transportId: this._recvTransport.id,
-            dtlsParameters
-          })
-          .then(callback)
-          .catch(errback);
-      });
-
-      this._recvTransport.on("connectionstatechange", connectionState => {
-        let level = "info";
-        if (connectionState === "failed" || connectionState === "disconnected") {
-          level = "error";
-        }
-        this.emitRTCEvent(level, "RTC", () => `Receive transport [connectionstatechange]: ${connectionState}`);
-
-        this.checkRecvIceStatus(connectionState);
-      });
+      await this.createSendTransport(iceServers);
+      await this.createRecvTransport(iceServers);
 
       const { peers } = await this._protoo.request("join", {
         displayName: this._clientId,
@@ -775,10 +905,6 @@ export default class DialogAdapter {
 
       if (this._onOccupantsChanged) {
         this._onOccupantsChanged(this.occupants);
-      }
-
-      if (this._localMediaStream) {
-        this.createMissingProducers(this._localMediaStream);
       }
     } catch (err) {
       this.emitRTCEvent("error", "Adapter", () => `Join room failed: ${error}`);
@@ -937,8 +1063,8 @@ export default class DialogAdapter {
     }
 
     // Close mediasoup Transports.
-    if (!this._sendTransport?._closed) this._sendTransport.close();
-    if (!this._recvTransport?._closed) this._recvTransport.close();
+    this.closeSendTransport();
+    this.closeRecvTransport();
 
     // Stop the ICE connection state watchdogs.
     this.stopSendIceConnectionStateWd();
