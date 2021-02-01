@@ -78,8 +78,12 @@ export default class MediaDevicesManager {
     return lastUsedMicDeviceId;
   }
 
-  get isMicDeviceSelected() {
+  get isMicShared() {
     return this.audioTrack !== null;
+  }
+
+  get isVideoShared() {
+    return this._mediaStream?.getVideoTracks().length > 0;
   }
 
   onDeviceChange = () => {
@@ -88,46 +92,52 @@ export default class MediaDevicesManager {
     });
   };
 
-  async selectMicDevice(deviceId) {
+  async fetchMediaDevices() {
+    return new Promise(resolve => {
+      navigator.mediaDevices.enumerateDevices().then(mediaDevices => {
+        this.micDevices = mediaDevices
+          .filter(d => d.kind === "audioinput")
+          .map(d => ({ value: d.deviceId, label: d.label || `Mic Device (${d.deviceId.substr(0, 9)})` }));
+        this.videoDevices = mediaDevices
+          .filter(d => d.kind === "videoinput")
+          .map(d => ({ value: d.deviceId, label: d.label || `Camera Device (${d.deviceId.substr(0, 9)})` }));
+        resolve();
+      });
+    });
+  }
+
+  async startMicShare(deviceId) {
+    let constraints = { audio: {} };
     if (deviceId) {
-      const constraints = { audio: { deviceId: { exact: [deviceId] } } };
-      const result = await this.fetchAudioTrack(constraints);
-      await this.setupNewMediaStream();
-      NAF.connection.adapter.enableMicrophone(true);
-
-      return result;
-    } else if (this.isMicDeviceSelected) {
-      const audioSystem = this._scene.systems["hubs-systems"].audioSystem;
-      audioSystem.removeStreamFromOutboundAudio("microphone");
-      this.audioTrack?.stop();
-      this.audioTrack = null;
-      this.mediaStream = null;
-      NAF.connection.adapter.enableMicrophone(false);
-
-      return null;
+      constraints = { audio: { deviceId: { exact: [deviceId] } } };
     }
-  }
 
-  async setMediaStreamToDeviceId(deviceId) {
-    let hasAudio = false;
+    const result = await this._startMicShare(constraints);
 
-    // Try to fetch last used mic, if there was one.
-    if (this.lastUsedMicDeviceId) {
-      hasAudio = await this.fetchAudioTrack({ audio: { deviceId } });
+    await this.fetchMediaDevices();
+
+    // we should definitely have an audioTrack at this point unless they denied mic access
+    if (this.audioTrack) {
+      const micDeviceId = this.micDeviceIdForMicLabel(this.micLabelForAudioTrack(this.audioTrack));
+      if (micDeviceId) {
+        this._store.update({ settings: { lastUsedMicDeviceId: micDeviceId } });
+        console.log(`Selected input device: ${this.micLabelForDeviceId(micDeviceId)}`);
+      }
+      this._scene.emit("local-media-stream-created");
     } else {
-      hasAudio = await this.fetchAudioTrack({ audio: {} });
+      console.log("No available audio tracks");
     }
 
-    await this.setupNewMediaStream();
+    NAF.connection.adapter.enableMicrophone(true);
 
-    return { hasAudio };
+    return result;
   }
 
-  async setMediaStreamToDefault() {
-    return await this.setMediaStreamToDeviceId(this.lastUsedMicDeviceId);
+  async startLastUsedMicShare() {
+    return await this.startMicShare(this.lastUsedMicDeviceId);
   }
 
-  async fetchAudioTrack(constraints = { audio: {} }) {
+  async _startMicShare(constraints = { audio: {} }) {
     if (this.audioTrack) {
       this.audioTrack.stop();
     }
@@ -160,6 +170,9 @@ export default class MediaDevicesManager {
       audioSystem.addStreamToOutboundAudio("microphone", newStream);
       this.mediaStream = audioSystem.outboundStream;
       this.audioTrack = newStream.getAudioTracks()[0];
+      this.audioTrack.addEventListener("ended", () => {
+        this._scene.emit("action_end_mic_sharing");
+      });
 
       if (/Oculus/.test(navigator.userAgent)) {
         // HACK Oculus Browser 6 seems to randomly end the microphone audio stream. This re-creates it.
@@ -191,34 +204,68 @@ export default class MediaDevicesManager {
     }
   }
 
-  async setupNewMediaStream() {
-    await this.fetchMediaDevices();
+  async stopMicShare() {
+    const audioSystem = this._scene.systems["hubs-systems"].audioSystem;
+    audioSystem.removeStreamFromOutboundAudio("microphone");
 
-    // we should definitely have an audioTrack at this point unless they denied mic access
-    if (this.audioTrack) {
-      const micDeviceId = this.micDeviceIdForMicLabel(this.micLabelForAudioTrack(this.audioTrack));
-      if (micDeviceId) {
-        this._store.update({ settings: { lastUsedMicDeviceId: micDeviceId } });
-        console.log(`Selected input device: ${this.micLabelForDeviceId(micDeviceId)}`);
-      }
-      this._scene.emit("local-media-stream-created");
-    } else {
-      console.log("No available audio tracks");
-    }
+    this.audioTrack?.stop();
+    this.audioTrack = null;
+
+    this._scene.emit("action_mute");
+
+    NAF.connection.adapter.enableMicrophone(false);
+    await NAF.connection.adapter.setLocalMediaStream(this._mediaStream);
   }
 
-  async fetchMediaDevices() {
-    return new Promise(resolve => {
-      navigator.mediaDevices.enumerateDevices().then(mediaDevices => {
-        this.micDevices = mediaDevices
-          .filter(d => d.kind === "audioinput")
-          .map(d => ({ value: d.deviceId, label: d.label || `Mic Device (${d.deviceId.substr(0, 9)})` }));
-        this.videoDevices = mediaDevices
-          .filter(d => d.kind === "videoinput")
-          .map(d => ({ value: d.deviceId, label: d.label || `Camera Device (${d.deviceId.substr(0, 9)})` }));
-        resolve();
+  async startVideoShare(constraints, isDisplayMedia, success, error) {
+    let newStream;
+
+    try {
+      if (isDisplayMedia) {
+        newStream = await navigator.mediaDevices.getDisplayMedia(constraints);
+      } else {
+        newStream = await navigator.mediaDevices.getUserMedia(constraints);
+      }
+    } catch (e) {
+      error();
+      return;
+    }
+
+    const videoTracks = newStream ? newStream.getVideoTracks() : [];
+    let videoTrackAdded = false;
+    if (videoTracks.length > 0) {
+      videoTrackAdded = true;
+
+      newStream.getVideoTracks().forEach(track => {
+        // Ideally we would use track.contentHint but it seems to be read-only in Chrome so we just add a custom property 
+        track["_hubs_contentHint"] = isDisplayMedia ? "share" : "camera";
+        track.addEventListener("ended", () => {
+          this._scene.emit("action_end_video_sharing");
+        });
+        this._mediaStream.addTrack(track);
       });
-    });
+
+      if (newStream && newStream.getAudioTracks().length > 0) {
+        const audioSystem = this._scene.systems["hubs-systems"].audioSystem;
+        audioSystem.addStreamToOutboundAudio("screenshare", newStream);
+      }
+
+      await NAF.connection.adapter.setLocalMediaStream(this._mediaStream);
+    }
+
+    success(isDisplayMedia, videoTrackAdded);
+  }
+
+  async stopVideoShare() {
+    for (const track of this._mediaStream.getVideoTracks()) {
+      track.stop(); // Stop video track to remove the "Stop screen sharing" bar right away.
+      this._mediaStream.removeTrack(track);
+    }
+
+    const audioSystem = this._scene.systems["hubs-systems"].audioSystem;
+    audioSystem.removeStreamFromOutboundAudio("screenshare");
+
+    await NAF.connection.adapter.setLocalMediaStream(this._mediaStream);
   }
 
   async shouldShowHmdMicWarning() {

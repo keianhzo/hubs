@@ -682,7 +682,7 @@ async function runBotMode(scene, entryManager) {
   };
 
   while (!NAF.connection.isConnected()) await nextTick();
-  entryManager.enterSceneWhenLoaded(new MediaStream(), false);
+  entryManager.enterSceneWhenLoaded(false);
 }
 
 function checkForAccountRequired() {
