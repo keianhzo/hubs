@@ -154,6 +154,14 @@ export default class DialogAdapter {
     this._clientId = clientId;
   }
 
+  getClientId() {
+    return this._clientId;
+  }
+
+  setAudioMixer(audioMixer) {
+    this._audioMixer = audioMixer;
+  }
+
   setServerConnectListeners(successListener, failureListener) {
     this._connectSuccess = successListener;
     this._connectFailure = failureListener;
@@ -444,6 +452,7 @@ export default class DialogAdapter {
     const urlWithParams = new URL(this._serverUrl);
     urlWithParams.searchParams.append("roomId", this._roomId);
     urlWithParams.searchParams.append("peerId", this._clientId);
+    urlWithParams.searchParams.append("audioMixer", this._audioMixer);
 
     const protooTransport = new protooClient.WebSocketTransport(urlWithParams.toString());
     this._protoo = new protooClient.Peer(protooTransport);
@@ -971,12 +980,15 @@ export default class DialogAdapter {
 
       // Create a promise that will be resolved once we attach to all the initial consumers.
       // This will gate the connection flow until all voices will be heard.
-      for (let i = 0; i < peers.length; i++) {
-        const peerId = peers[i].id;
-        this._onOccupantConnected(peerId);
-        this.occupants[peerId] = peers[i];
-        if (!peers[i].hasProducers) continue;
-        audioConsumerPromises.push(new Promise(res => this._initialAudioConsumerResolvers.set(peerId, res)));
+      // In case of using server side audio mixing, we don't need to sync the audio streams as we will only have one.
+      if (!this._audioMixer) {
+        for (let i = 0; i < peers.length; i++) {
+          const peerId = peers[i].id;
+          this._onOccupantConnected(peerId);
+          this.occupants[peerId] = peers[i];
+          if (!peers[i].hasProducers) continue;
+          audioConsumerPromises.push(new Promise(res => this._initialAudioConsumerResolvers.set(peerId, res)));
+        }
       }
 
       this._connectSuccess(this._clientId);
@@ -1089,7 +1101,8 @@ export default class DialogAdapter {
     this._cameraProducer = await this._sendTransport.produce({
       track,
       stopTracks: false,
-      codecOptions: { videoGoogleStartBitrate: 1000 }
+      codecOptions: { videoGoogleStartBitrate: 1000 },
+      encodings: WEBCAM_SIMULCAST_ENCODINGS
     });
 
     this._cameraProducer.on("transportclose", () => {

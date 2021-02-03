@@ -15,18 +15,22 @@ function createSilentAudioEl(stream) {
   return audioEl;
 }
 
-async function getOwnerId(el) {
-  const networkedEl = await NAF.utils.getNetworkedEntity(el).catch(e => {
-    console.error(INFO_INIT_FAILED, INFO_NO_NETWORKED_EL, e);
-  });
-  if (!networkedEl) {
-    return null;
+async function getOwnerId(el, local = false) {
+  if (local) {
+    return NAF.connection.adapter.getClientId();
+  } else {
+    const networkedEl = await NAF.utils.getNetworkedEntity(el).catch(e => {
+      console.error(INFO_INIT_FAILED, INFO_NO_NETWORKED_EL, e);
+    });
+    if (!networkedEl) {
+      return null;
+    }
+    return networkedEl.components.networked.data.owner;
   }
-  return networkedEl.components.networked.data.owner;
 }
 
-async function getMediaStream(el) {
-  const peerId = await getOwnerId(el);
+async function getMediaStream(el, local = false) {
+  const peerId = await getOwnerId(el, local);
   if (!peerId) {
     console.error(INFO_INIT_FAILED, INFO_NO_OWNER);
     return null;
@@ -56,12 +60,13 @@ AFRAME.registerComponent("avatar-audio-source", {
     },
     maxDistance: { default: 10000 },
     refDistance: { default: 1 },
-    rolloffFactor: { default: 1 }
+    rolloffFactor: { default: 1 },
+    local: { default: false }
   },
 
   createAudio: async function() {
     this.isCreatingAudio = true;
-    const stream = await getMediaStream(this.el);
+    const stream = await getMediaStream(this.el, this.data.local);
     this.isCreatingAudio = false;
     const isRemoved = !this.el.parentNode;
     if (!stream || isRemoved) return;
@@ -94,7 +99,7 @@ AFRAME.registerComponent("avatar-audio-source", {
     this.el.sceneEl.systems["hubs-systems"].audioSettingsSystem.registerAvatarAudioSource(this);
     // We subscribe to audio stream notifications for this peer to update the audio source
     // This could happen in case there is an ICE failure that requires a transport recreation.
-    getOwnerId(this.el).then(peerId => {
+    getOwnerId(this.el, this.data.local).then(peerId => {
       NAF.connection.adapter.addEventListener(peerId, "audio", this);
     });
     this.createAudio();
@@ -131,7 +136,7 @@ AFRAME.registerComponent("avatar-audio-source", {
 
   remove: function() {
     this.el.sceneEl.systems["hubs-systems"].audioSettingsSystem.unregisterAvatarAudioSource(this);
-    getOwnerId(this.el).then(peerId => {
+    getOwnerId(this.el, this.data.local).then(peerId => {
       NAF.connection.adapter.removeEventListener(peerId);
     });
     this.destroyAudio();

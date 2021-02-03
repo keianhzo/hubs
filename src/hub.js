@@ -636,6 +636,13 @@ function handleHubChannelJoined(entryManager, hubChannel, messageDispatch, data)
         .connect()
         .then(() => {
           clearTimeout(connectionErrorTimeout);
+          // Add a local audio source t
+          const viewingRig = document.querySelector("#viewing-rig");
+          viewingRig.setAttribute("avatar-audio-source", {
+            rolloffFactor: 2.0,
+            local: true,
+            positional: false
+          });
           scene.emit("didConnectToNetworkedScene");
         })
         .catch(connectError => {
@@ -1381,6 +1388,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
 
         adapter.setClientId(socket.params().session_id);
+        adapter.setAudioMixer("ffmpeg");
         adapter.setJoinToken(data.perms_token);
         setupPeerConnectionConfig(adapter);
 
