@@ -539,7 +539,7 @@ export default class DialogAdapter {
 
             // Notify of an stream update event of type (audio/video)
             if (this._listeners.has(peerId) && this._listeners.get(peerId)[kind]) {
-              this._listeners.get(peerId)[kind].onStreamUpdated(peerId, kind);
+              this._listeners.get(peerId)[kind].onConsumerStreamUpdated(peerId, kind);
             }
           } catch (err) {
             this.emitRTCEvent("error", "Adapter", () => `Error: ${err}`);
@@ -753,6 +753,34 @@ export default class DialogAdapter {
       promise.catch(e => {
         this.emitRTCEvent("error", "Adapter", () => `getMediaStream error: ${e}`);
         console.warn(`${clientId} getMediaStream Error`, e);
+      });
+      return promise;
+    }
+  }
+
+  getConsumerMediaStream(peerId, kind = "audio") {
+    let track;
+    this._consumers.forEach(consumer => {
+      if (consumer.appData.peerId === peerId && kind == consumer.track.kind) {
+        track = consumer.track;
+      }
+    });
+
+    if (track) {
+      debug(`Already had ${kind} for ${peerId}`);
+      return Promise.resolve(new MediaStream([track]));
+    } else {
+      debug(`Waiting on ${kind} for ${peerId}`);
+      if (!this._pendingMediaRequests.has(peerId)) {
+        this._pendingMediaRequests.set(peerId, {});
+      }
+
+      const requests = this._pendingMediaRequests.get(peerId);
+      const promise = new Promise((resolve, reject) => (requests[kind] = { resolve, reject }));
+      requests[kind].promise = promise;
+      promise.catch(e => {
+        this.emitRTCEvent("error", "Adapter", () => `getMediaStream error: ${e}`);
+        console.warn(`${peerId} getMediaStream Error`, e);
       });
       return promise;
     }

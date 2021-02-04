@@ -105,10 +105,10 @@ AFRAME.registerComponent("avatar-audio-source", {
     this.createAudio();
   },
 
-  async onStreamUpdated(peerId, kind) {
+  async onConsumerStreamUpdated(peerId, kind) {
     if (kind === "audio") {
       // The audio stream for this peer has been updated
-      const stream = await NAF.connection.adapter.getMediaStream(peerId, "audio").catch(e => {
+      const stream = await NAF.connection.adapter.getConsumerMediaStream(peerId, "audio").catch(e => {
         console.error(INFO_INIT_FAILED, `Error getting media stream for ${peerId}`, e);
       });
       const audioListener = this.el.sceneEl.audioListener;

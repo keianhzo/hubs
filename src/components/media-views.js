@@ -738,10 +738,10 @@ AFRAME.registerComponent("media-video", {
         // We subscribe to video stream notifications for this peer to update the video element
         // This could happen in case there is an ICE failure that requires a transport recreation.
         NAF.connection.adapter.addEventListener(streamClientId, "video", {
-          onStreamUpdated: async (peerId, kind) => {
+          onConsumerStreamUpdated: async (peerId, kind) => {
             if (peerId === streamClientId && kind === "video") {
               // The video stream for this peer has been updated
-              const stream = await NAF.connection.adapter.getMediaStream(peerId, "video").catch(e => {
+              const stream = await NAF.connection.adapter.getConsumerMediaStream(peerId, "video").catch(e => {
                 console.error(`Error getting video stream for ${peerId}`, e);
               });
               if (stream) {
