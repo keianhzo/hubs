@@ -1388,7 +1388,8 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
 
         adapter.setClientId(socket.params().session_id);
-        adapter.setAudioMixer("ffmpeg");
+        const audioMixer = qs.get("audioMixer");
+        adapter.setAudioMixer(audioMixer);
         adapter.setJoinToken(data.perms_token);
         setupPeerConnectionConfig(adapter);
 
