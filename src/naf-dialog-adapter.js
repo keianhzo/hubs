@@ -1000,7 +1000,8 @@ export default class DialogAdapter {
         device: this._device,
         rtpCapabilities: this._mediasoupDevice.rtpCapabilities,
         sctpCapabilities: this._useDataChannel ? this._mediasoupDevice.sctpCapabilities : undefined,
-        token: this._joinToken
+        token: this._joinToken,
+        audioMixer: this._audioMixer !== null ? this._audioMixer : undefined
       });
 
       const audioConsumerPromises = [];
