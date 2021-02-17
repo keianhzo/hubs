@@ -1113,7 +1113,7 @@ export default class DialogAdapter {
     this._micProducer = await this._sendTransport.produce({
       track,
       stopTracks: false,
-      codecOptions: { opusStereo: false, opusDtx: true }
+      codecOptions: { opusStereo: false, opusDtx: this._audioMixer ? false : true }
     });
 
     this._micProducer.on("transportclose", () => {
